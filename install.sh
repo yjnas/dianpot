@@ -16,376 +16,184 @@ echo "Token: $TOKEN"
 echo "端口: $PORT"
 echo ""
 
-# 安装依赖
-if command -v apt &>/dev/null; then
-  apt update && apt install -y curl jq netcat-openbsd
-elif command -v yum &>/dev/null; then
-  yum install -y curl jq nc
-elif command -v apk &>/dev/null; then
-  apk add curl jq netcat-openbsd
-else
-  echo "不支持的系统"
-  exit 1
+# 检测并安装Python
+echo "检查Python环境..."
+if ! command -v python3 &>/dev/null; then
+  echo "未找到Python3，正在安装..."
+  if command -v apt &>/dev/null; then
+    apt update && apt install -y python3
+  elif command -v yum &>/dev/null; then
+    yum install -y python3
+  elif command -v apk &>/dev/null; then
+    apk add python3
+  else
+    echo "错误: 无法自动安装Python3，请手动安装"
+    exit 1
+  fi
 fi
 
-# 创建探针脚本
-cat > /usr/local/bin/yj.sh <<'SCRIPT_EOF'
-#!/bin/bash
+PYTHON_CMD=$(command -v python3 || command -v python)
+echo "✅ Python: $PYTHON_CMD"
+echo ""
 
-PORT="${PORT:-37218}"
-TOKEN="${TOKEN:-}"
+# 创建Python探针脚本
+cat > /usr/local/bin/yujun-agent.py <<'PYTHON_EOF'
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import socket
+import subprocess
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime
 
-if [ -z "$TOKEN" ]; then
-  echo "错误: 请设置 TOKEN 环境变量"
-  exit 1
-fi
+PORT = int(os.environ.get('PORT', 37218))
+TOKEN = os.environ.get('TOKEN', '')
 
-get_system_info() {
-  cat <<EOF
-{"host":"$(hostname)","os":"$(uname -s)","arch":"$(uname -m)","kernel":"$(uname -r)","cpu_model":"$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)","cpu_cores":$(nproc),"total_memory":$(awk '/MemTotal/ {print $2}' /proc/meminfo),"total_disk":$(df / | awk 'NR==2 {print $2}'),"uptime":$(awk '{print int($1)}' /proc/uptime)}
+if not TOKEN:
+    print("错误: 请设置 TOKEN 环境变量")
+    sys.exit(1)
+
+def get_system_info():
+    """获取系统信息"""
+    try:
+        return {
+            'host': socket.gethostname(),
+            'os': subprocess.getoutput('uname -s'),
+            'arch': subprocess.getoutput('uname -m'),
+            'kernel': subprocess.getoutput('uname -r'),
+            'cpu_model': subprocess.getoutput("grep -m1 'model name' /proc/cpuinfo | cut -d: -f2").strip(),
+            'cpu_cores': int(subprocess.getoutput('nproc')),
+            'total_memory': int(subprocess.getoutput("awk '/MemTotal/ {print $2}' /proc/meminfo")),
+            'total_disk': int(subprocess.getoutput("df / | awk 'NR==2 {print $2}'")),
+            'uptime': int(float(subprocess.getoutput("awk '{print $1}' /proc/uptime")))
+        }
+    except Exception as e:
+        print(f"获取系统信息失败: {e}", file=sys.stderr)
+        return {}
+
+def get_metrics():
+    """获取实时指标"""
+    try:
+        cpu = float(subprocess.getoutput("top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1"))
+        mem_total = int(subprocess.getoutput("awk '/MemTotal/ {print $2}' /proc/meminfo"))
+        mem_avail = int(subprocess.getoutput("awk '/MemAvailable/ {print $2}' /proc/meminfo"))
+        mem_used = mem_total - mem_avail
+        mem_percent = (mem_used / mem_total) * 100
+        
+        disk_info = subprocess.getoutput("df / | awk 'NR==2 {print $2,$3,$5}'").split()
+        disk_total = int(disk_info[0])
+        disk_used = int(disk_info[1])
+        disk_percent = int(disk_info[2].rstrip('%'))
+        
+        net_in = int(subprocess.getoutput("cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0"))
+        net_out = int(subprocess.getoutput("cat /sys/class/net/eth0/statistics/tx_bytes 2>/dev/null || echo 0"))
+        
+        load = subprocess.getoutput("cat /proc/loadavg | awk '{print $1,$2,$3}'").split()
+        tcp = int(subprocess.getoutput("ss -tan | grep -c ESTAB"))
+        udp = int(subprocess.getoutput("ss -uan | wc -l"))
+        procs = int(subprocess.getoutput("ps aux | wc -l"))
+        
+        return {
+            'cpu': cpu,
+            'memory': mem_percent,
+            'memory_used': mem_used,
+            'disk': disk_percent,
+            'disk_used': disk_used,
+            'network_in': net_in,
+            'network_out': net_out,
+            'load_1': float(load[0]),
+            'load_5': float(load[1]),
+            'load_15': float(load[2]),
+            'tcp_count': tcp,
+            'udp_count': udp,
+            'process_count': procs
+        }
+    except Exception as e:
+        print(f"获取指标失败: {e}", file=sys.stderr)
+        return {}
+
+class ProbeHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        """自定义日志格式"""
+        sys.stderr.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {format % args}\n")
+    
+    def check_auth(self):
+        """检查Token认证"""
+        auth_header = self.headers.get('Authorization', '')
+        expected = f'Bearer {TOKEN}'
+        return auth_header == expected
+    
+    def send_json(self, data, status=200):
+        """发送JSON响应"""
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+    
+    def do_GET(self):
+        """处理GET请求"""
+        if not self.check_auth():
+            self.send_json({'error': 'Unauthorized'}, 401)
+            return
+        
+        if self.path == '/info':
+            self.send_json(get_system_info())
+        elif self.path == '/metrics':
+            self.send_json(get_metrics())
+        else:
+            self.send_json({'error': 'Not Found'}, 404)
+    
+    def do_POST(self):
+        """处理POST请求"""
+        if not self.check_auth():
+            self.send_json({'error': 'Unauthorized'}, 401)
+            return
+        
+        if self.path == '/reboot':
+            self.send_json({'success': True, 'message': 'Rebooting...'})
+            subprocess.Popen(['sh', '-c', 'sleep 2 && reboot'], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif self.path == '/shutdown':
+            self.send_json({'success': True, 'message': 'Shutting down...'})
+            subprocess.Popen(['sh', '-c', 'sleep 2 && shutdown -h now'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            self.send_json({'error': 'Not Found'}, 404)
+
+if __name__ == '__main__':
+    server = HTTPServer(('0.0.0.0', PORT), ProbeHandler)
+    print(f'🚀 昱君探针 API服务启动在端口 {PORT}')
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print('\n服务已停止')
+        sys.exit(0)
+PYTHON_EOF
+
+chmod +x /usr/local/bin/yujun-agent.py
+
+# 创建systemd服务
+cat > /etc/systemd/system/yujun-probe.service <<EOF
+[Unit]
+Description=YuJun Probe API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment="PORT=$PORT"
+Environment="TOKEN=$TOKEN"
+ExecStart=$PYTHON_CMD /usr/local/bin/yujun-agent.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
 EOF
-}
-
-get_metrics() {
-  local cpu=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
-  local mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-  local mem_avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-  local mem_used=$((mem_total - mem_avail))
-  local mem_percent=$(awk "BEGIN {printf \"%.2f\", ($mem_used/$mem_total)*100}")
-  local disk_total=$(df / | awk 'NR==2 {print $2}')
-  local disk_used=$(df / | awk 'NR==2 {print $3}')
-  local disk_percent=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
-  local net_in=$(cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
-  local net_out=$(cat /sys/class/net/eth0/statistics/tx_bytes 2>/dev/null || echo 0)
-  local load=$(cat /proc/loadavg | awk '{print $1,$2,$3}')
-  local tcp=$(ss -tan | grep -c ESTAB)
-  local udp=$(ss -uan | wc -l)
-  local procs=$(ps aux | wc -l)
-
-  cat <<EOF
-{"cpu":$cpu,"memory":$mem_percent,"memory_used":$mem_used,"disk":$disk_percent,"disk_used":$disk_used,"network_in":$net_in,"network_out":$net_out,"load_1":$(echo $load | awk '{print $1}'),"load_5":$(echo $load | awk '{print $2}'),"load_15":$(echo $load | awk '{print $3}'),"tcp_count":$tcp,"udp_count":$udp,"process_count":$procs}
-EOF
-}
-
-get_containers() {
-  if ! command -v docker &>/dev/null; then
-    echo '[]'
-    return
-  fi
-  docker ps -a --format '{"id":"{{.ID}}","name":"{{.Names}}","image":"{{.Image}}","status":"{{.Status}}","created":{{.CreatedAt}}}' 2>/dev/null | jq -s '.' || echo '[]'
-}
-
-get_processes() {
-  ps aux --sort=-%cpu | head -20 | awk 'NR>1 {printf "{\"pid\":%s,\"name\":\"%s\",\"cpu\":%s,\"memory\":%s},", $2, $11, $3, $4}' | sed 's/,$//' | awk '{print "["$0"]"}'
-}
-
-get_network() {
-  ss -tunap 2>/dev/null | awk 'NR>1 && $1!="Netid" {printf "{\"protocol\":\"%s\",\"local_addr\":\"%s\",\"remote_addr\":\"%s\",\"state\":\"%s\",\"pid\":0,\"program\":\"\"},", tolower($1), $5, $6, $2}' | sed 's/,$//' | awk '{print "["$0"]"}'
-}
-
-get_disks() {
-  df -T | awk 'NR>1 && $1!="tmpfs" {printf "{\"device\":\"%s\",\"mount_point\":\"%s\",\"fs_type\":\"%s\",\"total\":%s,\"used\":%s,\"available\":%s,\"use_percent\":%s},", $1, $7, $2, $3, $4, $5, substr($6,1,length($6)-1)}' | sed 's/,$//' | awk '{print "["$0"]"}'
-}
-
-get_services() {
-  if ! command -v systemctl &>/dev/null; then
-    echo '[]'
-    return
-  fi
-  systemctl list-units --type=service --all --no-pager --no-legend | awk '{printf "{\"name\":\"%s\",\"status\":\"%s\",\"enabled\":1},", $1, $3}' | sed 's/,$//' | awk '{print "["$0"]"}'
-}
-
-handle_request() {
-  local method=$1
-  local path=$2
-  local auth=$3
-  local body=$4
-
-  if [ "$auth" != "Bearer $TOKEN" ]; then
-    echo "HTTP/1.1 401 Unauthorized"
-    echo "Content-Type: application/json"
-    echo ""
-    echo '{"error":"Unauthorized"}'
-    return
-  fi
-
-  case "$method:$path" in
-    # 查询接口
-    GET:/info)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      get_system_info
-      ;;
-    GET:/metrics)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      get_metrics
-      ;;
-    GET:/containers)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      get_containers
-      ;;
-    GET:/processes)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      get_processes
-      ;;
-    GET:/network)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      get_network
-      ;;
-    GET:/disks)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      get_disks
-      ;;
-    GET:/services)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      get_services
-      ;;
-
-    # 系统操作
-    POST:/reboot)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true,"message":"Rebooting..."}'
-      nohup bash -c "sleep 2 && reboot" &>/dev/null &
-      ;;
-    POST:/shutdown)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true,"message":"Shutting down..."}'
-      nohup bash -c "sleep 2 && shutdown -h now" &>/dev/null &
-      ;;
-
-    # 容器操作
-    POST:/container/start/*)
-      local cid=$(echo "$path" | sed 's|/container/start/||')
-      docker start "$cid" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-    POST:/container/stop/*)
-      local cid=$(echo "$path" | sed 's|/container/stop/||')
-      docker stop "$cid" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-    POST:/container/restart/*)
-      local cid=$(echo "$path" | sed 's|/container/restart/||')
-      docker restart "$cid" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-    POST:/container/remove/*)
-      local cid=$(echo "$path" | sed 's|/container/remove/||')
-      docker rm -f "$cid" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-
-    # 服务操作
-    POST:/service/start/*)
-      local svc=$(echo "$path" | sed 's|/service/start/||')
-      systemctl start "$svc" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-    POST:/service/stop/*)
-      local svc=$(echo "$path" | sed 's|/service/stop/||')
-      systemctl stop "$svc" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-    POST:/service/restart/*)
-      local svc=$(echo "$path" | sed 's|/service/restart/||')
-      systemctl restart "$svc" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-
-    # 进程操作
-    POST:/process/kill/*)
-      local pid=$(echo "$path" | sed 's|/process/kill/||')
-      kill -9 "$pid" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-
-    # 文件操作
-    GET:/files/list/*)
-      local dir=$(echo "$path" | sed 's|/files/list||' | sed 's|^$|/|')
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      ls -lAh "$dir" 2>/dev/null | awk 'NR>1 {printf "{\"name\":\"%s\",\"size\":\"%s\",\"date\":\"%s %s %s\",\"perm\":\"%s\",\"type\":\"%s\"},", $9, $5, $6, $7, $8, $1, substr($1,1,1)}' | sed 's/,$//' | awk '{print "["$0"]"}'
-      ;;
-    GET:/files/read/*)
-      local file=$(echo "$path" | sed 's|/files/read||')
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      if [ -f "$file" ]; then
-        local content=$(cat "$file" 2>/dev/null | base64 -w 0)
-        echo "{\"success\":true,\"content\":\"$content\"}"
-      else
-        echo '{"success":false,"error":"File not found"}'
-      fi
-      ;;
-    POST:/files/write/*)
-      local file=$(echo "$path" | sed 's|/files/write||')
-      read content_length
-      read content
-      echo "$content" | base64 -d > "$file" 2>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-    POST:/files/delete/*)
-      local target=$(echo "$path" | sed 's|/files/delete||')
-      rm -rf "$target" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-    POST:/files/mkdir/*)
-      local dir=$(echo "$path" | sed 's|/files/mkdir||')
-      mkdir -p "$dir" &>/dev/null
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"success":true}'
-      ;;
-
-    # 命令执行
-    POST:/exec)
-      read content_length
-      read cmd_line
-      local cmd=$(echo "$cmd_line" | grep -oP '(?<="cmd":")[^"]*')
-      local output=$(eval "$cmd" 2>&1 | base64 -w 0)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo "{\"success\":true,\"output\":\"$output\"}"
-      ;;
-
-    # 日志查看
-    GET:/logs/*)
-      local logfile=$(echo "$path" | sed 's|/logs||')
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      if [ -f "$logfile" ]; then
-        local content=$(tail -n 100 "$logfile" 2>/dev/null | base64 -w 0)
-        echo "{\"success\":true,\"content\":\"$content\"}"
-      else
-        echo '{"success":false,"error":"Log file not found"}'
-      fi
-      ;;
-    GET:/logs/service/*)
-      local svc=$(echo "$path" | sed 's|/logs/service/||')
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      local content=$(journalctl -u "$svc" -n 100 --no-pager 2>/dev/null | base64 -w 0)
-      echo "{\"success\":true,\"content\":\"$content\"}"
-      ;;
-
-    # Docker高级操作
-    GET:/container/logs/*)
-      local cid=$(echo "$path" | sed 's|/container/logs/||')
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      local logs=$(docker logs --tail 100 "$cid" 2>&1 | base64 -w 0)
-      echo "{\"success\":true,\"logs\":\"$logs\"}"
-      ;;
-    POST:/container/exec/*)
-      local cid=$(echo "$path" | sed 's|/container/exec/||')
-      read content_length
-      read cmd_line
-      local cmd=$(echo "$cmd_line" | grep -oP '(?<="cmd":")[^"]*')
-      local output=$(docker exec "$cid" sh -c "$cmd" 2>&1 | base64 -w 0)
-      echo "HTTP/1.1 200 OK"
-      echo "Content-Type: application/json"
-      echo ""
-      echo "{\"success\":true,\"output\":\"$output\"}"
-      ;;
-
-    *)
-      echo "HTTP/1.1 404 Not Found"
-      echo "Content-Type: application/json"
-      echo ""
-      echo '{"error":"Not Found"}'
-      ;;
-  esac
-}
-
-echo "🚀 昱君探针 API服务启动在端口 $PORT"
-
-while true; do
-  nc -l -p $PORT -q 1 | {
-    read method path proto
-    auth=""
-    body=""
-    content_length=0
-    
-    # 读取HTTP头
-    while read line; do
-      line=$(echo "$line" | tr -d '\r')
-      [ -z "$line" ] && break
-      if echo "$line" | grep -q "^Authorization:"; then
-        auth=$(echo "$line" | cut -d' ' -f2-)
-      fi
-      if echo "$line" | grep -q "^Content-Length:"; then
-        content_length=$(echo "$line" | cut -d' ' -f2 | tr -d '\r')
-      fi
-    done
-    
-    # 读取请求体（如果有）
-    if [ "$content_length" -gt 0 ]; then
-      body=$(head -c $content_length)
-    fi
-    
-    handle_request "$method" "$path" "$auth" "$body"
-  }
-done
-SCRIPT_EOF
-
-chmod +x /usr/local/bin/yj.sh
 
 # 创建管理脚本
-cat > /usr/local/bin/yj <<'MANAGE_EOF'
+cat > /usr/local/bin/yujun-manage <<'MANAGE_EOF'
 #!/bin/bash
 
 show_banner() {
@@ -397,16 +205,16 @@ show_banner() {
 
 show_status() {
   echo "📊 服务状态:"
-  systemctl status yj --no-pager | head -10
+  systemctl status yujun-probe --no-pager | head -10
   echo ""
   echo "📡 监听端口:"
-  netstat -tlnp | grep yj || ss -tlnp | grep yj
+  netstat -tlnp | grep yujun-agent || ss -tlnp | grep python
   echo ""
 }
 
 show_logs() {
   echo "📋 最近日志:"
-  journalctl -u yj -n 50 --no-pager
+  journalctl -u yujun-probe -n 50 --no-pager
 }
 
 uninstall() {
@@ -414,13 +222,13 @@ uninstall() {
   read -r confirm
   if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
     echo "正在停止服务..."
-    systemctl stop yj
-    systemctl disable yj
+    systemctl stop yujun-probe
+    systemctl disable yujun-probe
 
     echo "正在删除文件..."
-    rm -f /etc/systemd/system/yj.service
-    rm -f /usr/local/bin/yj.sh
-    rm -f /usr/local/bin/yj
+    rm -f /etc/systemd/system/yujun-probe.service
+    rm -f /usr/local/bin/yujun-agent.py
+    rm -f /usr/local/bin/yujun-manage
 
     systemctl daemon-reload
 
@@ -453,19 +261,19 @@ while true; do
       ;;
     3)
       echo "正在重启服务..."
-      systemctl restart yj
+      systemctl restart yujun-probe
       echo "✅ 服务已重启"
       sleep 2
       ;;
     4)
       echo "正在停止服务..."
-      systemctl stop yj
+      systemctl stop yujun-probe
       echo "✅ 服务已停止"
       sleep 2
       ;;
     5)
       echo "正在启动服务..."
-      systemctl start yj
+      systemctl start yujun-probe
       echo "✅ 服务已启动"
       sleep 2
       ;;
@@ -485,31 +293,12 @@ while true; do
 done
 MANAGE_EOF
 
-chmod +x /usr/local/bin/yj
-
-# 创建systemd服务
-cat > /etc/systemd/system/yj.service <<EOF
-[Unit]
-Description=YuJun Probe API Service
-After=network.target
-
-[Service]
-Type=simple
-User=root
-Environment="PORT=$PORT"
-Environment="TOKEN=$TOKEN"
-ExecStart=/usr/local/bin/yj.sh
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
+chmod +x /usr/local/bin/yujun-manage
 
 # 启动服务
 systemctl daemon-reload
-systemctl enable yj
-systemctl start yj
+systemctl enable yujun-probe
+systemctl start yujun-probe
 
 echo ""
 echo "=========================================="
@@ -518,7 +307,7 @@ echo "=========================================="
 echo "服务端口: $PORT"
 echo ""
 echo "📋 管理命令:"
-echo "  yj          - 打开管理面板"
-echo "  systemctl status yj  - 查看服务状态"
-echo "  journalctl -u yj -f  - 查看实时日志"
+echo "  yujun-manage                  - 打开管理面板"
+echo "  systemctl status yujun-probe  - 查看服务状态"
+echo "  journalctl -u yujun-probe -f  - 查看实时日志"
 echo "=========================================="
