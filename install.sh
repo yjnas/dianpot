@@ -354,18 +354,31 @@ handle_request() {
 echo "🚀 昱君探针 API服务启动在端口 $PORT"
 
 while true; do
-  nc -l -p $PORT -q 1 | {
+  {
     read method path proto
     auth=""
+    body=""
+    content_length=0
+    
+    # 读取HTTP头
     while read line; do
       line=$(echo "$line" | tr -d '\r')
       [ -z "$line" ] && break
       if echo "$line" | grep -q "^Authorization:"; then
         auth=$(echo "$line" | cut -d' ' -f2-)
       fi
+      if echo "$line" | grep -q "^Content-Length:"; then
+        content_length=$(echo "$line" | cut -d' ' -f2 | tr -d '\r')
+      fi
     done
-    handle_request "$method" "$path" "$auth"
-  }
+    
+    # 读取请求体（如果有）
+    if [ "$content_length" -gt 0 ]; then
+      body=$(head -c $content_length)
+    fi
+    
+    handle_request "$method" "$path" "$auth" "$body"
+  } | nc -l -p $PORT -q 1
 done
 SCRIPT_EOF
 
