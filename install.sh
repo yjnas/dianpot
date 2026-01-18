@@ -440,6 +440,15 @@ class ProbeHandler(BaseHTTPRequestHandler):
         
         else:
             self.send_json({'error': 'Not Found'}, 404)
+    
+    def do_OPTIONS(self):
+        """处理OPTIONS预检请求（CORS）"""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.send_header('Access-Control-Max-Age', '86400')
+        self.end_headers()
 
 if __name__ == '__main__':
     server = HTTPServer(('0.0.0.0', PORT), ProbeHandler)
