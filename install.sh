@@ -29,7 +29,7 @@ else
 fi
 
 # 创建探针脚本
-cat > /usr/local/bin/yujun-agent.sh <<'SCRIPT_EOF'
+cat > /usr/local/bin/yj.sh <<'SCRIPT_EOF'
 #!/bin/bash
 
 PORT="${PORT:-37218}"
@@ -354,7 +354,7 @@ handle_request() {
 echo "🚀 昱君探针 API服务启动在端口 $PORT"
 
 while true; do
-  {
+  nc -l -p $PORT -q 1 | {
     read method path proto
     auth=""
     body=""
@@ -378,11 +378,11 @@ while true; do
     fi
     
     handle_request "$method" "$path" "$auth" "$body"
-  } | nc -l -p $PORT -q 1
+  }
 done
 SCRIPT_EOF
 
-chmod +x /usr/local/bin/yujun-agent.sh
+chmod +x /usr/local/bin/yj.sh
 
 # 创建管理脚本
 cat > /usr/local/bin/yj <<'MANAGE_EOF'
@@ -400,7 +400,7 @@ show_status() {
   systemctl status yj --no-pager | head -10
   echo ""
   echo "📡 监听端口:"
-  netstat -tlnp | grep yujun-agent || ss -tlnp | grep yujun-agent
+  netstat -tlnp | grep yj || ss -tlnp | grep yj
   echo ""
 }
 
@@ -419,7 +419,7 @@ uninstall() {
 
     echo "正在删除文件..."
     rm -f /etc/systemd/system/yj.service
-    rm -f /usr/local/bin/yujun-agent.sh
+    rm -f /usr/local/bin/yj.sh
     rm -f /usr/local/bin/yj
 
     systemctl daemon-reload
@@ -498,7 +498,7 @@ Type=simple
 User=root
 Environment="PORT=$PORT"
 Environment="TOKEN=$TOKEN"
-ExecStart=/usr/local/bin/yujun-agent.sh
+ExecStart=/usr/local/bin/yj.sh
 Restart=always
 RestartSec=10
 
