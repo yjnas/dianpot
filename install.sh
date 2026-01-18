@@ -18,9 +18,9 @@ echo ""
 
 # 清理旧安装
 echo "检查并清理旧安装..."
-systemctl stop yujun-probe 2>/dev/null
 systemctl stop yj 2>/dev/null
-systemctl disable yujun-probe 2>/dev/null
+systemctl stop yj 2>/dev/null
+systemctl disable yj 2>/dev/null
 
 # 杀死占用端口的进程
 if command -v lsof &>/dev/null; then
@@ -30,8 +30,8 @@ elif command -v fuser &>/dev/null; then
 fi
 
 # 杀死相关进程
-killall yujun-agent.sh 2>/dev/null
-pkill -f yujun-agent.py 2>/dev/null
+killall yj.sh 2>/dev/null
+pkill -f yj.py 2>/dev/null
 
 # 等待端口释放
 sleep 2
@@ -67,7 +67,7 @@ echo "✅ Python: $PYTHON_CMD"
 echo ""
 
 # 创建Python探针脚本
-cat > /usr/local/bin/yujun-agent.py <<'PYTHON_EOF'
+cat > /usr/local/bin/yj.py <<'PYTHON_EOF'
 #!/usr/bin/env python3
 import os
 import sys
@@ -453,10 +453,10 @@ if __name__ == '__main__':
         sys.exit(0)
 PYTHON_EOF
 
-chmod +x /usr/local/bin/yujun-agent.py
+chmod +x /usr/local/bin/yj.py
 
 # 创建systemd服务
-cat > /etc/systemd/system/yujun-probe.service <<EOF
+cat > /etc/systemd/system/yj.service <<EOF
 [Unit]
 Description=YuJun Probe API Service
 After=network.target
@@ -466,7 +466,7 @@ Type=simple
 User=root
 Environment="PORT=$PORT"
 Environment="TOKEN=$TOKEN"
-ExecStart=$PYTHON_CMD /usr/local/bin/yujun-agent.py
+ExecStart=$PYTHON_CMD /usr/local/bin/yj.py
 Restart=always
 RestartSec=10
 
@@ -475,7 +475,7 @@ WantedBy=multi-user.target
 EOF
 
 # 创建管理脚本
-cat > /usr/local/bin/yujun-manage <<'MANAGE_EOF'
+cat > /usr/local/bin/yj <<'MANAGE_EOF'
 #!/bin/bash
 
 show_banner() {
@@ -487,16 +487,16 @@ show_banner() {
 
 show_status() {
   echo "📊 服务状态:"
-  systemctl status yujun-probe --no-pager | head -10
+  systemctl status yj --no-pager | head -10
   echo ""
   echo "📡 监听端口:"
-  netstat -tlnp | grep yujun-agent || ss -tlnp | grep python
+  netstat -tlnp | grep yj || ss -tlnp | grep python
   echo ""
 }
 
 show_logs() {
   echo "📋 最近日志:"
-  journalctl -u yujun-probe -n 50 --no-pager
+  journalctl -u yj -n 50 --no-pager
 }
 
 uninstall() {
@@ -504,13 +504,13 @@ uninstall() {
   read -r confirm
   if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
     echo "正在停止服务..."
-    systemctl stop yujun-probe
-    systemctl disable yujun-probe
+    systemctl stop yj
+    systemctl disable yj
 
     echo "正在删除文件..."
-    rm -f /etc/systemd/system/yujun-probe.service
-    rm -f /usr/local/bin/yujun-agent.py
-    rm -f /usr/local/bin/yujun-manage
+    rm -f /etc/systemd/system/yj.service
+    rm -f /usr/local/bin/yj.py
+    rm -f /usr/local/bin/yj
 
     systemctl daemon-reload
 
@@ -543,19 +543,19 @@ while true; do
       ;;
     3)
       echo "正在重启服务..."
-      systemctl restart yujun-probe
+      systemctl restart yj
       echo "✅ 服务已重启"
       sleep 2
       ;;
     4)
       echo "正在停止服务..."
-      systemctl stop yujun-probe
+      systemctl stop yj
       echo "✅ 服务已停止"
       sleep 2
       ;;
     5)
       echo "正在启动服务..."
-      systemctl start yujun-probe
+      systemctl start yj
       echo "✅ 服务已启动"
       sleep 2
       ;;
@@ -575,12 +575,12 @@ while true; do
 done
 MANAGE_EOF
 
-chmod +x /usr/local/bin/yujun-manage
+chmod +x /usr/local/bin/yj
 
 # 启动服务
 systemctl daemon-reload
-systemctl enable yujun-probe
-systemctl start yujun-probe
+systemctl enable yj
+systemctl start yj
 
 echo ""
 echo "=========================================="
@@ -589,7 +589,7 @@ echo "=========================================="
 echo "服务端口: $PORT"
 echo ""
 echo "📋 管理命令:"
-echo "  yujun-manage                  - 打开管理面板"
-echo "  systemctl status yujun-probe  - 查看服务状态"
-echo "  journalctl -u yujun-probe -f  - 查看实时日志"
+echo "  yj                  - 打开管理面板"
+echo "  systemctl status yj  - 查看服务状态"
+echo "  journalctl -u yj -f  - 查看实时日志"
 echo "=========================================="
